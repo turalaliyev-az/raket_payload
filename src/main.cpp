@@ -28,8 +28,8 @@ struct GPSData {
 static GPSData gps;
 
 // ======================== UMUMI SABITLER ========================
-#define DEVICE_HEADER F("CC")
-#define DEVICE_NAME   "DRONE (CC)"
+#define DEVICE_HEADER F("BB")
+#define DEVICE_NAME   "PAYLOAD (BB)"
 #define LED_PIN         13
 #define RF_SERIAL       Serial2
 #define RF_BAUD         115200
