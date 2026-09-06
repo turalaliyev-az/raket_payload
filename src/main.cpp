@@ -57,7 +57,7 @@ static GPSData gps;
 // ESC_MODE_PWM = 1 -> ESC_PIN standart 50Hz PWM ESC siqnali
 #define ESC_MODE_PWM  0
 
-#if ESC_MODE_PWM == 0
+#if ESC_MODE_PWM == 1
 #define ESC_PWM_FREQ  50.0f
 #define ESC_US_OFF    1000
 #define ESC_US_RUN    1480
@@ -68,9 +68,11 @@ static uint32_t us_to_duty(uint16_t us) {
 }
 #endif
 
-// ======================== TEST REJIMI ========================
-#define SABIT_TEST_MODU   1   // 1 = masa testi, pinler her zaman aktiv
-                              // 0 = normal ucus/atilma/zerbe mentigi
+// ======================== ZERO-G OUTPUT PARAMETRLERI ========================
+#define ZERO_G_ON_THRESHOLD   0.30f   // Bu deyerden asagida zero-G qebul edilir
+#define ZERO_G_OFF_THRESHOLD  0.70f   // Bu deyerden yuxarida G var qebul edilir
+#define ZERO_G_ACTIVATE_MS    100UL   // Zero-G bu qeder davam etse output aktiv olur
+#define G_DEACTIVATE_MS       50UL    // G bu qeder davam etse output kesilir
 
 void pins_init() {
     pinMode(ESC_PIN, OUTPUT);
@@ -89,7 +91,7 @@ void pins_init() {
     analogWrite(BUZZER_PIN, 0);
 }
 
-static void set_ground_outputs(bool active) {
+static void set_outputs(bool active) {
 #if ESC_MODE_PWM == 1
     analogWrite(ESC_PIN, active ? us_to_duty(ESC_US_RUN) : us_to_duty(ESC_US_OFF));
 #else
@@ -130,7 +132,14 @@ static uint8_t launch_count = 0;
 static uint8_t impact_count = 0;
 static uint32_t soft_start_ms = 0;
 static uint32_t impact_candidate_ms = 0;
+
 static float fast_g = 1.0f;
+static bool fast_g_valid = false;
+
+// ======================== OUTPUT STATE ========================
+static bool outputs_active = false;
+static uint32_t zero_g_start_ms = 0;
+static uint32_t g_restore_start_ms = 0;
 
 // ======================== RF EMRLERI ========================
 static bool _armed = true;
@@ -844,7 +853,7 @@ static uint8_t serial2_rx_buf[128];
 #define FLAG_GPS_FIX        0x0008
 #define FLAG_ARMED          0x0010
 #define FLAG_CAL_SAVED      0x0020
-#define FLAG_GROUND         0x0040
+#define FLAG_OUTPUT_ACTIVE  0x0040
 
 static uint16_t rf_seq = 0;
 
@@ -914,10 +923,10 @@ static void rf_write_packet(uint8_t type, const uint8_t* payload, uint8_t len) {
     RF_SERIAL.write(buf, i);
 }
 
-static void rf_send_status_event(uint8_t ground_status) {
+static void rf_send_status_event(uint8_t output_status) {
     uint8_t p[2];
     size_t i = 0;
-    put_u8(p, i, ground_status);
+    put_u8(p, i, output_status);
     put_u8(p, i, (uint8_t)flight_phase);
     rf_write_packet(RF_PKT_STATUS, p, i);
 }
@@ -933,7 +942,7 @@ static void rf_send_binary_telemetry() {
     if (ok.gps_fix) flags |= FLAG_GPS_FIX;
     if (rf_armed()) flags |= FLAG_ARMED;
     if (bno_cal_saved) flags |= FLAG_CAL_SAVED;
-    if (flight_phase == PHASE_ON_GROUND) flags |= FLAG_GROUND;
+    if (outputs_active) flags |= FLAG_OUTPUT_ACTIVE;
 
     put_u16(p, i, flags);
 
@@ -999,7 +1008,7 @@ static void rf_send_binary_telemetry() {
     put_u16(p, i, f_u16(fast_g, 1000.0f));
 
     put_u8(p, i, (uint8_t)flight_phase);
-    put_u8(p, i, (flight_phase == PHASE_ON_GROUND) ? 1 : 0);
+    put_u8(p, i, outputs_active ? 1 : 0);
 
     rf_write_packet(RF_PKT_TELEM, p, i);
 }
@@ -1049,7 +1058,7 @@ void bno_calibration_monitor(uint32_t now) {
 
 // ======================== FAZA FUNKSIYASI ========================
 void flight_phase_update(uint32_t now) {
-    if (!ok.bno055) {
+    if (!ok.bno055 || !fast_g_valid) {
         flight_phase = PHASE_PRE_LAUNCH;
         launch_count = 0;
         impact_count = 0;
@@ -1126,6 +1135,50 @@ void flight_phase_update(uint32_t now) {
     }
 }
 
+// ======================== ZERO-G OUTPUT CONTROL ========================
+void output_control_update(uint32_t now) {
+    // Sensor etibarsizdirsa fail-safe: outputlar kesilir
+    if (!ok.bno055 || !fast_g_valid || isnan(fast_g) || isinf(fast_g)) {
+        if (outputs_active) {
+            set_outputs(false);
+        }
+        outputs_active = false;
+        zero_g_start_ms = 0;
+        g_restore_start_ms = 0;
+        return;
+    }
+
+    if (!outputs_active) {
+        // Zero-G ashkarlanirsa ve debounce müddeti keçirse output aktiv olur
+        if (fast_g < ZERO_G_ON_THRESHOLD) {
+            if (zero_g_start_ms == 0) {
+                zero_g_start_ms = now;
+            } else if (now - zero_g_start_ms >= ZERO_G_ACTIVATE_MS) {
+                outputs_active = true;
+                set_outputs(true);
+                g_restore_start_ms = 0;
+                Serial.println(F("[OUT] Zero-G -> BUZZER/ESC ACTIVE"));
+            }
+        } else {
+            zero_g_start_ms = 0;
+        }
+    } else {
+        // G qayidarsa ve debounce müddeti keçirse output kesilir
+        if (fast_g > ZERO_G_OFF_THRESHOLD) {
+            if (g_restore_start_ms == 0) {
+                g_restore_start_ms = now;
+            } else if (now - g_restore_start_ms >= G_DEACTIVATE_MS) {
+                outputs_active = false;
+                set_outputs(false);
+                zero_g_start_ms = 0;
+                Serial.println(F("[OUT] G detected -> BUZZER/ESC OFF"));
+            }
+        } else {
+            g_restore_start_ms = 0;
+        }
+    }
+}
+
 // ======================== SETUP ========================
 void setup() {
     pinMode(LED_PIN, OUTPUT);
@@ -1135,15 +1188,9 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
-
-#if SABIT_TEST_MODU == 1
-    Serial.println(F("[REJIM] SABIT TEST: Launch/Impact deaktivdir. Pinler her zaman aktiv."));
-#else
-    Serial.println(F("[REJIM] NORMAL UCUS: Launch/Impact/Soft-landing mentigi aktivdir."));
-#endif
-
-    Serial.println(F("[USB TEST] 'c' = BNO kalibrasiyasini EEPROM-a yaz"));
-    Serial.println(F("[USB TEST] 'x' = EEPROM kalibrasiyasini sil"));
+    Serial.println(F("[REJIM] ZERO-G OUTPUT: G yoksa BUZZER/ESC aktiv, G varsa deaktiv"));
+    Serial.println(F("[USB] 'c' = BNO kalibrasiyasini EEPROM-a yaz"));
+    Serial.println(F("[USB] 'x' = EEPROM kalibrasiyasini sil"));
 
     rf_command_init();
     altvel.init();
@@ -1217,12 +1264,17 @@ void setup() {
     Serial.println(F("[FILTER] Attitude EKF initialized"));
 
     Serial.print(F("[RF] Serial2 @ ")); Serial.print(RF_BAUD);
-    Serial.print(F(" baud, Binary Protocol Active")); Serial.println();
+    Serial.println(F(" baud, Binary Protocol Active"));
 
     uint32_t now = millis();
     lastBno = lastBme = lastAht = lastGps = lastPrn = lastRf = lastGpsDbg = now;
     lastMag = now;
     last_imu_us = 0;
+    fast_g_valid = false;
+    outputs_active = false;
+    zero_g_start_ms = 0;
+    g_restore_start_ms = 0;
+
     digitalWrite(LED_PIN, LOW);
 }
 
@@ -1279,7 +1331,9 @@ void loop() {
             if (imu_finite) {
                 float raw_g = sqrtf(ax*ax + ay*ay + az*az) / GRAVITY;
                 if (isnan(raw_g) || isinf(raw_g)) raw_g = 1.0f;
+
                 fast_g += FAST_G_ALPHA * (raw_g - fast_g);
+                fast_g_valid = true;
 
                 uint32_t now_us = micros();
                 float dt_imu = 0.01f;
@@ -1294,17 +1348,19 @@ void loop() {
                 ekf.update(ax, ay, az);
                 ekf.getEulerDeg(mad_roll, mad_pitch, mad_yaw);
 
-#if SABIT_TEST_MODU == 0
                 flight_phase_update(now);
-#endif
+            } else {
+                fast_g_valid = false;
             }
+        } else {
+            fast_g_valid = false;
         }
     }
 
     // Mag yaw correction (20 Hz)
     if (now - lastMag >= MAG_PERIOD) {
         lastMag = now;
-        if (ok.bno055 && fast_g > 0.7f && fast_g < 1.8f) {
+        if (ok.bno055 && fast_g_valid && fast_g > 0.7f && fast_g < 1.8f) {
             ekf.updateMag(mx, my, mz);
         }
     }
@@ -1326,7 +1382,8 @@ void loop() {
                 float accel_norm = GRAVITY;
                 float a_world_z = GRAVITY;
 
-                if (ok.bno055 && !(isnan(ax) || isinf(ax) || isnan(ay) || isinf(ay) || isnan(az) || isinf(az))) {
+                if (ok.bno055 && fast_g_valid &&
+                    !(isnan(ax) || isinf(ax) || isnan(ay) || isinf(ay) || isnan(az) || isinf(az))) {
                     accel_norm = sqrtf(ax*ax + ay*ay + az*az);
                     float v_body[3] = {ax, ay, az};
                     float v_world[3];
@@ -1348,24 +1405,16 @@ void loop() {
         aht_h = humidity.relative_humidity;
     }
 
-#if SABIT_TEST_MODU == 1
-    flight_phase = PHASE_ON_GROUND;
-#endif
-
-    // Outputs
-    if (flight_phase == PHASE_ON_GROUND) {
-        set_ground_outputs(true);
-    } else {
-        set_ground_outputs(false);
-    }
+    // Zero-G based output control
+    output_control_update(now);
 
     // RF status change
-    static uint8_t last_rf_gnd_status = 255;
-    uint8_t current_status = (flight_phase == PHASE_ON_GROUND) ? 1 : 0;
+    static uint8_t last_rf_output_status = 255;
+    uint8_t current_output_status = outputs_active ? 1 : 0;
 
-    if (current_status != last_rf_gnd_status) {
-        rf_send_status_event(current_status);
-        last_rf_gnd_status = current_status;
+    if (current_output_status != last_rf_output_status) {
+        rf_send_status_event(current_output_status);
+        last_rf_output_status = current_output_status;
     }
 
     // BNO calibration monitor
@@ -1457,9 +1506,9 @@ void loop() {
         else if (flight_phase == PHASE_IN_AIR) Serial.print(F("IN_AIR"));
         else if (flight_phase == PHASE_ON_GROUND) Serial.print(F("ON_GROUND"));
 
-        Serial.print(F(" alt=")); Serial.print(altvel.rel_alt,2);
-        Serial.print(F(" vel=")); Serial.print(altvel.vel,2);
-        Serial.print(F(" g=")); Serial.print(altvel.g_force,2);
+        Serial.print(F(" | OUT:"));
+        Serial.print(outputs_active ? F("ACTIVE") : F("OFF"));
+
         Serial.print(F(" fast_g=")); Serial.print(fast_g,2);
         Serial.println();
     }
