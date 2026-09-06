@@ -28,8 +28,8 @@ struct GPSData {
 static GPSData gps;
 
 // ======================== UMUMI SABITLER ========================
-#define DEVICE_HEADER F("BB")
-#define DEVICE_NAME   "PAYLOAD (BB)"
+#define DEVICE_HEADER F("CC")
+#define DEVICE_NAME   "DRONE (CC)"
 #define LED_PIN         13
 #define RF_SERIAL       Serial2
 #define RF_BAUD         115200
@@ -57,7 +57,7 @@ static GPSData gps;
 // ESC_MODE_PWM = 1 -> ESC_PIN standart 50Hz PWM ESC siqnali
 #define ESC_MODE_PWM  0
 
-#if ESC_MODE_PWM == 1
+#if ESC_MODE_PWM == 0
 #define ESC_PWM_FREQ  50.0f
 #define ESC_US_OFF    1000
 #define ESC_US_RUN    1480
@@ -68,11 +68,15 @@ static uint32_t us_to_duty(uint16_t us) {
 }
 #endif
 
-// ======================== ZERO-G OUTPUT PARAMETRLERI ========================
-#define ZERO_G_ON_THRESHOLD   0.30f   // Bu deyerden asagida zero-G qebul edilir
-#define ZERO_G_OFF_THRESHOLD  0.70f   // Bu deyerden yuxarida G var qebul edilir
-#define ZERO_G_ACTIVATE_MS    100UL   // Zero-G bu qeder davam etse output aktiv olur
-#define G_DEACTIVATE_MS       50UL    // G bu qeder davam etse output kesilir
+// ======================== OUTPUT MODE ========================
+// 0 = hereketsizlikde aktiv, hereket/G olduqda kesilir
+// 1 = hereket/G olduqda aktiv, hereketsizlikde kesilir
+#define OUTPUT_ACTIVE_ON_MOTION   0
+
+#define MOTION_GYRO_THRESHOLD       0.15f
+#define MOTION_ACCEL_DEV_THRESHOLD  0.25f
+#define INACTIVITY_ACTIVATE_MS      200UL
+#define MOTION_DEACTIVATE_MS        50UL
 
 void pins_init() {
     pinMode(ESC_PIN, OUTPUT);
@@ -138,8 +142,8 @@ static bool fast_g_valid = false;
 
 // ======================== OUTPUT STATE ========================
 static bool outputs_active = false;
-static uint32_t zero_g_start_ms = 0;
-static uint32_t g_restore_start_ms = 0;
+static uint32_t inactive_start_ms = 0;
+static uint32_t motion_start_ms = 0;
 
 // ======================== RF EMRLERI ========================
 static bool _armed = true;
@@ -1135,46 +1139,67 @@ void flight_phase_update(uint32_t now) {
     }
 }
 
-// ======================== ZERO-G OUTPUT CONTROL ========================
+// ======================== MOTION/INACTIVITY OUTPUT CONTROL ========================
 void output_control_update(uint32_t now) {
-    // Sensor etibarsizdirsa fail-safe: outputlar kesilir
-    if (!ok.bno055 || !fast_g_valid || isnan(fast_g) || isinf(fast_g)) {
+    if (!ok.bno055 || !fast_g_valid ||
+        isnan(fast_g) || isinf(fast_g) ||
+        isnan(gx) || isinf(gx) ||
+        isnan(gy) || isinf(gy) ||
+        isnan(gz) || isinf(gz)) {
+
         if (outputs_active) {
             set_outputs(false);
         }
+
         outputs_active = false;
-        zero_g_start_ms = 0;
-        g_restore_start_ms = 0;
+        inactive_start_ms = 0;
+        motion_start_ms = 0;
         return;
     }
 
+    float gxb = gx - ekf.b[0];
+    float gyb = gy - ekf.b[1];
+    float gzb = gz - ekf.b[2];
+
+    float gyro_mag = sqrtf(gxb*gxb + gyb*gyb + gzb*gzb);
+    float accel_dev = fabsf(fast_g - 1.0f);
+
+    bool motion = (gyro_mag > MOTION_GYRO_THRESHOLD) ||
+                  (accel_dev > MOTION_ACCEL_DEV_THRESHOLD);
+
+    bool target_active;
+
+#if OUTPUT_ACTIVE_ON_MOTION == 1
+    target_active = motion;       // hereketde aktiv
+#else
+    target_active = !motion;      // hereketsizlikde aktiv
+#endif
+
     if (!outputs_active) {
-        // Zero-G ashkarlanirsa ve debounce müddeti keçirse output aktiv olur
-        if (fast_g < ZERO_G_ON_THRESHOLD) {
-            if (zero_g_start_ms == 0) {
-                zero_g_start_ms = now;
-            } else if (now - zero_g_start_ms >= ZERO_G_ACTIVATE_MS) {
+        if (target_active) {
+            if (inactive_start_ms == 0) {
+                inactive_start_ms = now;
+            } else if (now - inactive_start_ms >= INACTIVITY_ACTIVATE_MS) {
                 outputs_active = true;
                 set_outputs(true);
-                g_restore_start_ms = 0;
-                Serial.println(F("[OUT] Zero-G -> BUZZER/ESC ACTIVE"));
+                motion_start_ms = 0;
+                Serial.println(F("[OUT] Stable/No-motion -> BUZZER/ESC ACTIVE"));
             }
         } else {
-            zero_g_start_ms = 0;
+            inactive_start_ms = 0;
         }
     } else {
-        // G qayidarsa ve debounce müddeti keçirse output kesilir
-        if (fast_g > ZERO_G_OFF_THRESHOLD) {
-            if (g_restore_start_ms == 0) {
-                g_restore_start_ms = now;
-            } else if (now - g_restore_start_ms >= G_DEACTIVATE_MS) {
+        if (!target_active) {
+            if (motion_start_ms == 0) {
+                motion_start_ms = now;
+            } else if (now - motion_start_ms >= MOTION_DEACTIVATE_MS) {
                 outputs_active = false;
                 set_outputs(false);
-                zero_g_start_ms = 0;
-                Serial.println(F("[OUT] G detected -> BUZZER/ESC OFF"));
+                inactive_start_ms = 0;
+                Serial.println(F("[OUT] Motion/G -> BUZZER/ESC OFF"));
             }
         } else {
-            g_restore_start_ms = 0;
+            motion_start_ms = 0;
         }
     }
 }
@@ -1188,14 +1213,13 @@ void setup() {
     Serial.begin(115200);
     delay(200);
     Serial.println(F("\n=== TEENSY 4.1 " DEVICE_NAME " ==="));
-    Serial.println(F("[REJIM] ZERO-G OUTPUT: G yoksa BUZZER/ESC aktiv, G varsa deaktiv"));
+    Serial.println(F("[REJIM] Hereketsizlikde AKTIV, hereket/G olduqda KESILIR"));
     Serial.println(F("[USB] 'c' = BNO kalibrasiyasini EEPROM-a yaz"));
     Serial.println(F("[USB] 'x' = EEPROM kalibrasiyasini sil"));
 
     rf_command_init();
     altvel.init();
     
-    // Teensy Serial Buffer Artirma
     Serial2.addMemoryForWrite(serial2_tx_buf, sizeof(serial2_tx_buf));
     Serial2.addMemoryForRead(serial2_rx_buf, sizeof(serial2_rx_buf));
     RF_SERIAL.begin(RF_BAUD);
@@ -1272,8 +1296,8 @@ void setup() {
     last_imu_us = 0;
     fast_g_valid = false;
     outputs_active = false;
-    zero_g_start_ms = 0;
-    g_restore_start_ms = 0;
+    inactive_start_ms = 0;
+    motion_start_ms = 0;
 
     digitalWrite(LED_PIN, LOW);
 }
@@ -1405,7 +1429,7 @@ void loop() {
         aht_h = humidity.relative_humidity;
     }
 
-    // Zero-G based output control
+    // Motion/inactivity based output control
     output_control_update(now);
 
     // RF status change
