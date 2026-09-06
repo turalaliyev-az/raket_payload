@@ -457,7 +457,7 @@ void AttitudeEKF::getEulerDeg(float &roll, float &pitch, float &yaw) const {
 #define RF_SERIAL       Serial2
 #define RF_BAUD         115200
 // Serial1: Teensy 4.1 pin 0 = RX1, pin 1 = TX1
-#define GPS_SERIAL      Serial1
+#define GPS_SERIAL      Serial6
 #define GPS_BAUD        9600
 #define GPS_AGE_MAX_MS  3000UL   // 3 saniyeden kohne data = fix itirilib
 #define I2C_FREQ        400000UL
